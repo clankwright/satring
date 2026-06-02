@@ -8,8 +8,9 @@ from pymacaroons import Macaroon, Verifier
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.config import settings, payments_enabled
+from app.config import settings, payments_enabled, nwc_enabled
 from app.models import ConsumedPayment
+from app import nwc as nwc_backend
 
 logger = logging.getLogger("satring.l402")
 
@@ -17,11 +18,16 @@ logger = logging.getLogger("satring.l402")
 async def check_payment_status(payment_hash: str) -> tuple[bool, int]:
     """Return (paid, amount_sats). (False, 0) on any error or unpaid invoice.
 
-    Amount is the settled amount in sats, parsed from the LNBits response.
-    Callers MUST verify amount >= their endpoint's price to prevent
-    cross-endpoint payment reuse (paying a cheap invoice and replaying the
-    hash at an expensive endpoint).
+    Amount is the settled amount in sats. Uses NWC (NIP-47) when configured,
+    falling back to the LNBits HTTP API. Callers MUST verify amount >= their
+    endpoint's price to prevent cross-endpoint payment reuse (paying a cheap
+    invoice and replaying the hash at an expensive endpoint).
     """
+    if nwc_enabled():
+        try:
+            return await nwc_backend.lookup_invoice(payment_hash)
+        except Exception as e:
+            logger.warning("NWC lookup_invoice failed (%s); falling back to LNBits", e)
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.get(
@@ -55,6 +61,12 @@ async def check_and_consume_payment(payment_hash: str, db: AsyncSession) -> bool
 
 
 async def create_invoice(amount_sats: int, memo: str = "satring.com L402") -> dict:
+    """Mint a bolt11 invoice. Uses NWC (NIP-47) when configured, else LNBits."""
+    if nwc_enabled():
+        try:
+            return await nwc_backend.make_invoice(amount_sats, memo)
+        except Exception as e:
+            logger.warning("NWC make_invoice failed (%s); falling back to LNBits", e)
     try:
         async with httpx.AsyncClient(timeout=10) as client:
             resp = await client.post(

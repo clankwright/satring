@@ -22,6 +22,9 @@ class Settings:
         return url
     PAYMENT_URL: str = os.getenv("PAYMENT_URL", "")
     PAYMENT_KEY: str = os.getenv("PAYMENT_KEY", "")
+    # Nostr Wallet Connect (NIP-47). When set to a nostr+walletconnect:// URI,
+    # invoices are minted and looked up over NWC instead of the LNbits HTTP API.
+    NWC_CONNECTION_URI: str = os.getenv("NWC_CONNECTION_URI", "")
     AUTH_ROOT_KEY: str = os.getenv("AUTH_ROOT_KEY", "")
     AUTH_PRICE_SATS: int = int(os.getenv("AUTH_PRICE_SATS", "100"))
     AUTH_PRICE_USD: str = os.getenv("AUTH_PRICE_USD", "0.05")
@@ -69,6 +72,11 @@ def payments_enabled() -> bool:
 def x402_enabled() -> bool:
     """Return True if x402 payments are configured (wallet address set)."""
     return bool(settings.X402_PAY_TO)
+
+
+def nwc_enabled() -> bool:
+    """Return True if a Nostr Wallet Connect URI is configured as the Lightning backend."""
+    return bool(settings.NWC_CONNECTION_URI)
 
 # SECURITY: Input length limits shared across API models, web form handlers,
 # and HTML templates. Change values here — not in individual files.
