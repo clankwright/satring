@@ -28,6 +28,9 @@ _agent_buffer: dict[tuple[str, str], int] = defaultdict(int)
 _agent_ip_sets: dict[tuple[str, str], set[str]] = defaultdict(set)
 
 _lock = asyncio.Lock()
+# Serializes flush() calls so two flushes can never read the same buffered
+# batch (the periodic loop and the shutdown final-flush can otherwise race).
+_flush_lock = asyncio.Lock()
 _flush_task: asyncio.Task | None = None
 
 EXCLUDED_PREFIXES = ("/static/", "/favicon", "/openapi.json", "/docs")
@@ -173,132 +176,140 @@ def record_agent(user_agent: str, client_ip: str) -> None:
 async def flush() -> None:
     """Snapshot buffer, upsert rows into RouteUsage, and purge old data.
 
-    The buffer is only cleared after a successful DB commit. If the write
-    fails (e.g. database locked), data stays in the buffer for the next flush.
+    The buffers are drained atomically when snapshotted, so every batch is
+    counted exactly once: a *failed* write merges the snapshot back for retry,
+    a *successful* commit drops it. A batch that already committed is never
+    re-queued (the ``committed`` guard) — previously a post-commit error would
+    re-merge a committed batch and double the counts on every cycle, inflating
+    hit_count toward powers of two. ``_flush_lock`` keeps flushes from
+    overlapping and reading the same batch twice.
     """
-    async with _lock:
-        has_data = bool(_buffer) or bool(_detail_buffer) or bool(_agent_buffer)
-        if not has_data:
-            return
-        snapshot = dict(_buffer)
-        detail_snapshot = dict(_detail_buffer)
-        agent_snapshot = dict(_agent_buffer)
-        # Snapshot IP set sizes but keep sets alive for the current hour
-        current_hour = utc_now().replace(
-            minute=0, second=0, microsecond=0
-        ).isoformat()
-        ip_counts = {k: len(v) for k, v in _ip_sets.items()}
-        detail_ip_counts = {k: len(v) for k, v in _detail_ip_sets.items()}
-        agent_ip_counts = {k: len(v) for k, v in _agent_ip_sets.items()}
-
-    try:
-        async with async_session() as db:
-            for (route, source, hour_key), count in snapshot.items():
-                hour = datetime.fromisoformat(hour_key)
-                unique = ip_counts.get((route, source, hour_key), 0)
-                result = await db.execute(
-                    select(RouteUsage).where(
-                        RouteUsage.route == route,
-                        RouteUsage.source == source,
-                        RouteUsage.hour == hour,
-                    )
-                )
-                row = result.scalars().first()
-                if row:
-                    row.hit_count += count
-                    # For the current hour the IP set is still accumulating,
-                    # so overwrite with the latest total. For past hours the
-                    # final count was captured before eviction.
-                    row.unique_ips = unique
-                else:
-                    db.add(RouteUsage(
-                        route=route, source=source,
-                        hour=hour, hit_count=count, unique_ips=unique,
-                    ))
-
-            # Flush detail buffer
-            for (dimension, value, hour_key), count in detail_snapshot.items():
-                hour = datetime.fromisoformat(hour_key)
-                unique = detail_ip_counts.get((dimension, value, hour_key), 0)
-                result = await db.execute(
-                    select(UsageDetail).where(
-                        UsageDetail.dimension == dimension,
-                        UsageDetail.value == value,
-                        UsageDetail.hour == hour,
-                    )
-                )
-                row = result.scalars().first()
-                if row:
-                    row.hit_count += count
-                    row.unique_ips = unique
-                else:
-                    db.add(UsageDetail(
-                        dimension=dimension, value=value,
-                        hour=hour, hit_count=count, unique_ips=unique,
-                    ))
-
-            # Flush agent buffer
-            for (agent_class, hour_key), count in agent_snapshot.items():
-                hour = datetime.fromisoformat(hour_key)
-                unique = agent_ip_counts.get((agent_class, hour_key), 0)
-                result = await db.execute(
-                    select(AgentUsage).where(
-                        AgentUsage.agent_class == agent_class,
-                        AgentUsage.hour == hour,
-                    )
-                )
-                row = result.scalars().first()
-                if row:
-                    row.hit_count += count
-                    row.unique_ips = unique
-                else:
-                    db.add(AgentUsage(
-                        agent_class=agent_class,
-                        hour=hour, hit_count=count, unique_ips=unique,
-                    ))
-
-            # Purge old data (bulk DELETE, no loading into Python)
-            cutoff = utc_now() - timedelta(days=USAGE_RETENTION_DAYS)
-            await db.execute(
-                delete(RouteUsage).where(RouteUsage.hour < cutoff)
-            )
-            await db.execute(
-                delete(UsageDetail).where(UsageDetail.hour < cutoff)
-            )
-            await db.execute(
-                delete(AgentUsage).where(AgentUsage.hour < cutoff)
-            )
-
-            await db.commit()
-    except Exception:
-        # DB write failed; re-merge snapshot back into the live buffer so
-        # data is retried on the next flush cycle instead of being lost.
+    async with _flush_lock:
         async with _lock:
-            for key, count in snapshot.items():
-                _buffer[key] += count
-            for key, count in detail_snapshot.items():
-                _detail_buffer[key] += count
-            for key, count in agent_snapshot.items():
-                _agent_buffer[key] += count
-        raise
+            has_data = bool(_buffer) or bool(_detail_buffer) or bool(_agent_buffer)
+            if not has_data:
+                return
+            # Drain now: snapshot, then clear under the same lock so concurrent
+            # request increments accumulate fresh and this batch can't be re-read.
+            snapshot = dict(_buffer)
+            detail_snapshot = dict(_detail_buffer)
+            agent_snapshot = dict(_agent_buffer)
+            _buffer.clear()
+            _detail_buffer.clear()
+            _agent_buffer.clear()
+            # Snapshot IP set sizes but keep sets alive for the current hour
+            current_hour = utc_now().replace(
+                minute=0, second=0, microsecond=0
+            ).isoformat()
+            ip_counts = {k: len(v) for k, v in _ip_sets.items()}
+            detail_ip_counts = {k: len(v) for k, v in _detail_ip_sets.items()}
+            agent_ip_counts = {k: len(v) for k, v in _agent_ip_sets.items()}
 
-    # Only clear and evict after successful commit
-    async with _lock:
-        for key in snapshot:
-            _buffer.pop(key, None)
-        for key in detail_snapshot:
-            _detail_buffer.pop(key, None)
-        for key in agent_snapshot:
-            _agent_buffer.pop(key, None)
-        # Evict IP sets for past hours (no longer needed)
-        for sets_dict in (_ip_sets, _detail_ip_sets):
-            stale = [k for k in sets_dict if k[2] != current_hour]
-            for k in stale:
-                del sets_dict[k]
-        # Agent IP sets use 2-tuples (no source field)
-        stale_agent = [k for k in _agent_ip_sets if k[1] != current_hour]
-        for k in stale_agent:
-            del _agent_ip_sets[k]
+        committed = False
+        try:
+            async with async_session() as db:
+                for (route, source, hour_key), count in snapshot.items():
+                    hour = datetime.fromisoformat(hour_key)
+                    unique = ip_counts.get((route, source, hour_key), 0)
+                    result = await db.execute(
+                        select(RouteUsage).where(
+                            RouteUsage.route == route,
+                            RouteUsage.source == source,
+                            RouteUsage.hour == hour,
+                        )
+                    )
+                    row = result.scalars().first()
+                    if row:
+                        row.hit_count += count
+                        # For the current hour the IP set is still accumulating,
+                        # so overwrite with the latest total. For past hours the
+                        # final count was captured before eviction.
+                        row.unique_ips = unique
+                    else:
+                        db.add(RouteUsage(
+                            route=route, source=source,
+                            hour=hour, hit_count=count, unique_ips=unique,
+                        ))
+
+                # Flush detail buffer
+                for (dimension, value, hour_key), count in detail_snapshot.items():
+                    hour = datetime.fromisoformat(hour_key)
+                    unique = detail_ip_counts.get((dimension, value, hour_key), 0)
+                    result = await db.execute(
+                        select(UsageDetail).where(
+                            UsageDetail.dimension == dimension,
+                            UsageDetail.value == value,
+                            UsageDetail.hour == hour,
+                        )
+                    )
+                    row = result.scalars().first()
+                    if row:
+                        row.hit_count += count
+                        row.unique_ips = unique
+                    else:
+                        db.add(UsageDetail(
+                            dimension=dimension, value=value,
+                            hour=hour, hit_count=count, unique_ips=unique,
+                        ))
+
+                # Flush agent buffer
+                for (agent_class, hour_key), count in agent_snapshot.items():
+                    hour = datetime.fromisoformat(hour_key)
+                    unique = agent_ip_counts.get((agent_class, hour_key), 0)
+                    result = await db.execute(
+                        select(AgentUsage).where(
+                            AgentUsage.agent_class == agent_class,
+                            AgentUsage.hour == hour,
+                        )
+                    )
+                    row = result.scalars().first()
+                    if row:
+                        row.hit_count += count
+                        row.unique_ips = unique
+                    else:
+                        db.add(AgentUsage(
+                            agent_class=agent_class,
+                            hour=hour, hit_count=count, unique_ips=unique,
+                        ))
+
+                # Purge old data (bulk DELETE, no loading into Python)
+                cutoff = utc_now() - timedelta(days=USAGE_RETENTION_DAYS)
+                await db.execute(
+                    delete(RouteUsage).where(RouteUsage.hour < cutoff)
+                )
+                await db.execute(
+                    delete(UsageDetail).where(UsageDetail.hour < cutoff)
+                )
+                await db.execute(
+                    delete(AgentUsage).where(AgentUsage.hour < cutoff)
+                )
+
+                await db.commit()
+                committed = True
+        except Exception:
+            # Only re-merge if the batch was NOT committed. Re-queuing a
+            # committed batch is what caused the doubling bug.
+            if not committed:
+                async with _lock:
+                    for key, count in snapshot.items():
+                        _buffer[key] += count
+                    for key, count in detail_snapshot.items():
+                        _detail_buffer[key] += count
+                    for key, count in agent_snapshot.items():
+                        _agent_buffer[key] += count
+            raise
+
+        # Committed: the batch was already drained above; just evict IP sets
+        # for past hours (no longer needed).
+        async with _lock:
+            for sets_dict in (_ip_sets, _detail_ip_sets):
+                stale = [k for k in sets_dict if k[2] != current_hour]
+                for k in stale:
+                    del sets_dict[k]
+            # Agent IP sets use 2-tuples (no source field)
+            stale_agent = [k for k in _agent_ip_sets if k[1] != current_hour]
+            for k in stale_agent:
+                del _agent_ip_sets[k]
 
     # Update denormalized hit counts on Service (best-effort, non-blocking)
     try:
