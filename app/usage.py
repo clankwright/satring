@@ -324,7 +324,10 @@ async def _update_service_hit_counts() -> None:
     Uses a single SQL UPDATE with correlated subqueries for efficiency.
     Runs after each flush cycle to keep counts fresh.
     """
-    now = utc_now()
+    # route_usage/usage_detail.hour is `timestamp without time zone`, so the
+    # cutoffs must be naive UTC — comparing against tz-aware values raises
+    # "can't subtract offset-naive and offset-aware datetimes" under asyncpg.
+    now = utc_now().replace(tzinfo=None)
     seven_ago = now - timedelta(days=7)
     thirty_ago = now - timedelta(days=30)
 
