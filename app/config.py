@@ -102,6 +102,10 @@ FREE_API_RESULTS_PER_DAY = 5        # max service summaries returned per IP per 
 RATE_DETAIL_API = "15/minute"
 RATE_SITEMAP = "3/hour"
 RATE_PAYMENT_STATUS = "30/minute"
+# Per-IP cap on the unauthenticated Lightning-invoice-minting GET endpoints
+# (reputation/analytics invoices) and the submit/rate POSTs that mint an invoice
+# before payment. Without this a bot loops them to drain the LNbits wallet.
+RATE_INVOICE = "10/minute"
 
 # Endpoint usage tracking
 USAGE_FLUSH_INTERVAL = 60       # seconds between DB flushes

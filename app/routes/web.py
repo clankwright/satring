@@ -19,6 +19,7 @@ from app.config import (
     MAX_MPP_METHOD, MAX_MPP_REALM, MAX_MPP_CURRENCY,
     RATE_EDIT, RATE_DELETE, RATE_RECOVER,
     RATE_SEARCH, RATE_PAYMENT_STATUS, RATE_SITEMAP, RATE_DETAIL_API,
+    RATE_SUBMIT, RATE_REVIEW, RATE_INVOICE,
 )
 from app.database import get_db
 from app.l402 import create_invoice, check_payment_status, check_and_consume_payment
@@ -346,6 +347,7 @@ async def submit_recover_form(request: Request, db: AsyncSession = Depends(get_d
 
 
 @router.post("/submit")
+@limiter.limit(RATE_SUBMIT)
 async def submit_service(
     request: Request,
     background_tasks: BackgroundTasks,
@@ -909,6 +911,7 @@ async def recover_service(
 
 
 @router.post("/services/{slug}/rate", response_class=HTMLResponse)
+@limiter.limit(RATE_REVIEW)
 async def rate_service(
     request: Request,
     slug: str,
@@ -994,6 +997,7 @@ async def rate_service(
 
 
 @router.get("/services/{slug}/reputation-invoice", response_class=HTMLResponse)
+@limiter.limit(RATE_INVOICE)
 async def reputation_invoice(request: Request, slug: str, db: AsyncSession = Depends(get_db)):
     # Verify service exists
     result = await db.execute(
@@ -1039,6 +1043,7 @@ async def reputation_result(request: Request, slug: str, payment_hash: str = "",
 
 
 @router.get("/services/{slug}/analytics-invoice", response_class=HTMLResponse)
+@limiter.limit(RATE_INVOICE)
 async def service_analytics_invoice(request: Request, slug: str, db: AsyncSession = Depends(get_db)):
     # Verify service exists
     result = await db.execute(
@@ -1083,6 +1088,7 @@ async def service_analytics_result(request: Request, slug: str, payment_hash: st
 
 
 @router.get("/analytics-invoice", response_class=HTMLResponse)
+@limiter.limit(RATE_INVOICE)
 async def analytics_invoice(request: Request, db: AsyncSession = Depends(get_db)):
     if not payments_enabled():
         data = await build_analytics_data(db)
