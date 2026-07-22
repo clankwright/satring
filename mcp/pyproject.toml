@@ -6,7 +6,7 @@ requires-python = ">=3.10"
 dependencies = ["mcp>=1.0.0", "httpx>=0.27"]
 license = "MIT"
 readme = "README.md"
-authors = [{ name = "toadlyBroodle" }]
+authors = [{ name = "clankwright" }]
 keywords = ["mcp", "l402", "x402", "lightning", "api-directory", "bitcoin", "usdc"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -17,7 +17,7 @@ classifiers = [
 
 [project.urls]
 Homepage = "https://satring.com"
-Repository = "https://github.com/toadlyBroodle/satring"
+Repository = "https://github.com/clankwright/satring"
 
 [project.scripts]
 satring-mcp = "satring_mcp:main_sync"

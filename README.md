@@ -39,7 +39,7 @@ AI agents can now [pay for APIs autonomously](https://lightning.engineering/post
 ## Quick Start
 
 ```bash
-git clone https://github.com/toadlyBroodle/satring.git
+git clone https://github.com/clankwright/satring.git
 cd satring
 python -m venv .venv
 source .venv/bin/activate
