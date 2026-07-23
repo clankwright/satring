@@ -1,6 +1,6 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.toadlyBroodle/satring-mcp",
+  "name": "io.github.clankwright/satring-mcp",
   "title": "Satring MCP",
   "description": "Discover and compare L402 + x402 paid API services from satring.com",
   "version": "0.1.2",
