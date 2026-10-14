@@ -23,6 +23,11 @@ from app.config import (
 )
 from app.database import get_db
 from app.l402 import create_invoice, check_payment_status, check_and_consume_payment
+from app.submissions import (
+    PublishResult,
+    publish_pending_submission,
+    store_pending_submission,
+)
 from app.main import templates, limiter
 from app.models import Service, Category, Rating, service_categories
 from app.routes.api import build_reputation_data, build_analytics_data, build_service_analytics
@@ -457,6 +462,55 @@ async def submit_service(
         pricing_sats, pricing_model, owner_name, owner_contact, client_ip, recovery_mode,
     )
 
+    submission_payload = {
+        "name": name, "url": url, "description": description,
+        "protocol": protocol, "pricing_sats": pricing_sats,
+        "pricing_model": pricing_model, "owner_name": owner_name,
+        "owner_contact": owner_contact, "logo_url": logo_url,
+        "existing_edit_token": existing_edit_token,
+        "x402_network": x402_network, "x402_asset": x402_asset,
+        "x402_pay_to": x402_pay_to, "pricing_usd": pricing_usd,
+        "mpp_method": mpp_method, "mpp_realm": mpp_realm, "mpp_currency": mpp_currency,
+        "category_ids": category_ids,
+    }
+
+    def _success(service, edit_token, token_reused):
+        return templates.TemplateResponse(request, "services/submit_success.html", {
+            "service": service,
+            "edit_token": edit_token,
+            "token_reused": token_reused,
+        })
+
+    def _queue_verify(service):
+        email = extract_email(service.owner_contact or "")
+        if email and not service.domain_verified:
+            background_tasks.add_task(send_verify_email, email, service.slug, extract_domain(service.url))
+
+    async def _finish_published(published: PublishResult):
+        if published.service is not None:
+            if published.created:
+                _queue_verify(published.service)
+            return _success(published.service, published.edit_token, published.token_reused)
+        if not published.paid:
+            return HTMLResponse(
+                f"<h1>Payment not verified</h1><p>Invoice not paid or insufficient amount (need {settings.AUTH_SUBMIT_PRICE_SATS} sats).</p>",
+                status_code=402,
+            )
+        if published.blocked:
+            return await _render_error("A service with this URL already exists.", status_code=409)
+        return HTMLResponse(
+            "<h1>Payment already used</h1><p>This payment has already been consumed.</p>",
+            status_code=402,
+        )
+
+    # A paid invoice with a stored payload publishes even when this POST's
+    # form fields differ, and even when the listing was already created by
+    # the background publisher (the payment page would otherwise 409).
+    if payments_enabled() and payment_hash_form:
+        published = await publish_pending_submission(db, payment_hash_form)
+        if published is not None:
+            return await _finish_published(published)
+
     # Reject duplicate URLs before payment gate so users don't pay for a rejected submission
     existing = await find_existing_service(db, url)
     if existing:
@@ -474,6 +528,13 @@ async def submit_service(
             invoice = await create_invoice(
                 settings.AUTH_SUBMIT_PRICE_SATS, "satring.com service submission"
             )
+            try:
+                await store_pending_submission(db, invoice["payment_hash"], submission_payload)
+            except Exception:
+                logger.exception(
+                    "SUBMIT pending store failed name=%r url=%r ip=%s", name, url, client_ip,
+                )
+                await db.rollback()
             # Build hidden fields for resubmission
             form_fields = {
                 "name": name, "url": url, "description": description,
@@ -498,6 +559,8 @@ async def submit_service(
 
         # Verify payment. SECURITY: also verify amount matches the submission
         # price so a hash from a cheaper endpoint can't be replayed here.
+        # Hashes with no stored payload (invoices issued before pending
+        # submissions existed, or a failed store) still complete from the form.
         paid, paid_sats = await check_payment_status(payment_hash)
         if not paid or paid_sats < settings.AUTH_SUBMIT_PRICE_SATS:
             return HTMLResponse(
@@ -1127,11 +1190,35 @@ async def analytics_result(request: Request, payment_hash: str = "", db: AsyncSe
 
 @router.get("/payment-status/{payment_hash}")
 @limiter.limit(RATE_PAYMENT_STATUS)
-async def payment_status(request: Request, payment_hash: str):
+async def payment_status(
+    request: Request,
+    payment_hash: str,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db),
+):
     if not payments_enabled():
         return JSONResponse({"paid": True})
-    paid, _ = await check_payment_status(payment_hash)
-    return JSONResponse({"paid": paid})
+    paid, paid_sats = await check_payment_status(payment_hash)
+    # Clients that pay and only poll this URL never send the follow-up POST.
+    # Publishing here makes that poll enough to list the service.
+    if paid:
+        try:
+            published = await publish_pending_submission(
+                db, payment_hash, payment=(paid, paid_sats),
+            )
+        except Exception:
+            logger.exception("payment-status publish failed hash=%s", payment_hash)
+            published = None
+        if published and published.created and published.service is not None:
+            email = extract_email(published.service.owner_contact or "")
+            if email and not published.service.domain_verified:
+                background_tasks.add_task(
+                    send_verify_email,
+                    email,
+                    published.service.slug,
+                    extract_domain(published.service.url),
+                )
+    return JSONResponse({"paid": bool(paid)})
 
 
 @router.get("/")

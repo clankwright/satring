@@ -23,8 +23,11 @@ async def init_db():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-    # Migrate: add columns to existing services table if missing
+    # Migrate: add columns to existing services table if missing.
+    # information_schema is PostgreSQL; create_all already built a fresh schema elsewhere.
     async with engine.begin() as conn:
+        if conn.dialect.name != "postgresql":
+            return
         result = await conn.execute(sqlalchemy.text(
             "SELECT column_name FROM information_schema.columns WHERE table_name = 'services'"
         ))

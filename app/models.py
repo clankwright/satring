@@ -92,6 +92,25 @@ class ConsumedPayment(Base):
     consumed_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
 
+class PendingSubmission(Base):
+    """Form payload saved with the submission invoice.
+
+    The listing is created when that invoice is paid, including when the
+    client never sends the follow-up POST (it only polls payment status).
+    """
+
+    __tablename__ = "pending_submissions"
+
+    payment_hash = Column(String(128), primary_key=True)
+    payload = Column(Text, nullable=False)
+    edit_token = Column(String(128), nullable=True)
+    token_reused = Column(Boolean, default=False)
+    service_id = Column(Integer, ForeignKey("services.id", ondelete="SET NULL"), nullable=True)
+    error = Column(String(200), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    published_at = Column(DateTime(timezone=True), nullable=True)
+
+
 class RouteUsage(Base):
     __tablename__ = "route_usage"
 

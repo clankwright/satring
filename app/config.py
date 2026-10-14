@@ -110,3 +110,9 @@ RATE_INVOICE = "10/minute"
 # Endpoint usage tracking
 USAGE_FLUSH_INTERVAL = 60       # seconds between DB flushes
 USAGE_RETENTION_DAYS = 90       # auto-purge older data
+
+# How often to publish submission invoices that were paid but never
+# completed with a follow-up POST. The browser does that POST itself;
+# this catches clients that only poll /payment-status.
+PENDING_PUBLISH_INTERVAL = int(os.getenv("PENDING_PUBLISH_INTERVAL", "15"))
+PENDING_PUBLISH_MAX_AGE_HOURS = 48
