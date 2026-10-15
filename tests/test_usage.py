@@ -151,6 +151,39 @@ async def test_aggregation(usage_db, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_flush_merges_naive_hour_rows(usage_db, monkeypatch):
+    """Existing usage rows store hour as timestamp without time zone.
+
+    A flush must update those rows instead of raising TypeError when the
+    ORM compares them with a timezone-aware cutoff.
+    """
+    from app import usage as usage_mod
+
+    engine, _session = usage_db
+    test_session_factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    monkeypatch.setattr(usage_mod, "async_session", test_session_factory)
+
+    naive_hour = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0, tzinfo=None)
+    async with test_session_factory() as db:
+        db.add(RouteUsage(
+            route="/naive-hour", source="web", hour=naive_hour,
+            hit_count=4, unique_ips=1,
+        ))
+        await db.commit()
+
+    record_hit("/naive-hour", "web", "1.2.3.4")
+    await flush()
+
+    async with test_session_factory() as check_db:
+        rows = (await check_db.execute(
+            select(RouteUsage).where(RouteUsage.route == "/naive-hour")
+        )).scalars().all()
+        assert len(rows) == 1
+        assert rows[0].hit_count == 5
+        assert rows[0].hour.tzinfo is None
+
+
+@pytest.mark.asyncio
 async def test_unique_ips_dedup(usage_db, monkeypatch):
     """Same IP hitting the same endpoint multiple times counts as 1 unique."""
     from app import usage as usage_mod

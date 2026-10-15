@@ -2,7 +2,7 @@ import asyncio
 import logging
 import re
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from app.utils import utc_now
 
@@ -87,6 +87,18 @@ _NORMALIZE_PATTERNS = [
     # Payment status
     (re.compile(r"^/payment-status/[^/]+$"), "/payment-status/{hash}"),
 ]
+
+
+def _naive_utc(dt: datetime) -> datetime:
+    """UTC value for timestamp-without-time-zone columns.
+
+    route_usage, usage_detail, and agent_usage.hour are timestamp without
+    time zone. Comparing those values with timezone-aware datetimes raises
+    TypeError in the ORM.
+    """
+    if dt.tzinfo is not None:
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
 
 
 def _normalize_path(path: str) -> str:
@@ -209,7 +221,7 @@ async def flush() -> None:
         try:
             async with async_session() as db:
                 for (route, source, hour_key), count in snapshot.items():
-                    hour = datetime.fromisoformat(hour_key)
+                    hour = _naive_utc(datetime.fromisoformat(hour_key))
                     unique = ip_counts.get((route, source, hour_key), 0)
                     result = await db.execute(
                         select(RouteUsage).where(
@@ -233,7 +245,7 @@ async def flush() -> None:
 
                 # Flush detail buffer
                 for (dimension, value, hour_key), count in detail_snapshot.items():
-                    hour = datetime.fromisoformat(hour_key)
+                    hour = _naive_utc(datetime.fromisoformat(hour_key))
                     unique = detail_ip_counts.get((dimension, value, hour_key), 0)
                     result = await db.execute(
                         select(UsageDetail).where(
@@ -254,7 +266,7 @@ async def flush() -> None:
 
                 # Flush agent buffer
                 for (agent_class, hour_key), count in agent_snapshot.items():
-                    hour = datetime.fromisoformat(hour_key)
+                    hour = _naive_utc(datetime.fromisoformat(hour_key))
                     unique = agent_ip_counts.get((agent_class, hour_key), 0)
                     result = await db.execute(
                         select(AgentUsage).where(
@@ -272,8 +284,10 @@ async def flush() -> None:
                             hour=hour, hit_count=count, unique_ips=unique,
                         ))
 
-                # Purge old data (bulk DELETE, no loading into Python)
-                cutoff = utc_now() - timedelta(days=USAGE_RETENTION_DAYS)
+                # Purge old data. hour columns are timestamp without time zone,
+                # and this session already holds those rows, so the cutoff must
+                # be naive UTC or the ORM comparison raises TypeError.
+                cutoff = _naive_utc(utc_now()) - timedelta(days=USAGE_RETENTION_DAYS)
                 await db.execute(
                     delete(RouteUsage).where(RouteUsage.hour < cutoff)
                 )
@@ -324,10 +338,8 @@ async def _update_service_hit_counts() -> None:
     Uses a single SQL UPDATE with correlated subqueries for efficiency.
     Runs after each flush cycle to keep counts fresh.
     """
-    # route_usage/usage_detail.hour is `timestamp without time zone`, so the
-    # cutoffs must be naive UTC — comparing against tz-aware values raises
-    # "can't subtract offset-naive and offset-aware datetimes" under asyncpg.
-    now = utc_now().replace(tzinfo=None)
+    # Same naive-UTC rule as flush(): these columns have no time zone.
+    now = _naive_utc(utc_now())
     seven_ago = now - timedelta(days=7)
     thirty_ago = now - timedelta(days=30)
 
