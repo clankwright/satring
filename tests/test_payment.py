@@ -274,3 +274,40 @@ class TestL402ReplayProtection:
                 "score": 5, "comment": "Stolen token review",
             }, headers={"Authorization": auth_header})
             assert resp2.status_code == 402
+
+
+# ---------------------------------------------------------------------------
+# Lightning outage must not block x402 (issue #19)
+# ---------------------------------------------------------------------------
+
+class TestLightningOutageFallback:
+    SUBMIT_BODY = {
+        "name": "Outage Fallback Service",
+        "url": "https://outage-fallback.example.com",
+        "category_ids": [1],
+    }
+
+    @pytest.mark.asyncio
+    async def test_x402_only_challenge_when_lightning_down(self, payment_client):
+        from fastapi import HTTPException
+        down = HTTPException(status_code=502, detail="Payment service unavailable")
+        with patch.object(settings, "AUTH_ROOT_KEY", "outage-test-key"), \
+             patch.object(settings, "X402_PAY_TO", "0x" + "ab" * 20), \
+             patch("app.payment.create_invoice", new_callable=AsyncMock, side_effect=down):
+            resp = await payment_client.post("/api/v1/services", json=self.SUBMIT_BODY)
+        assert resp.status_code == 402
+        assert "payment-required" in resp.headers
+        assert "www-authenticate" not in resp.headers
+        detail = resp.json()["detail"]
+        assert detail["lightning_unavailable"] is True
+        assert set(detail["how_to_pay"]) == {"x402"}
+
+    @pytest.mark.asyncio
+    async def test_502_when_lightning_down_and_no_x402(self, payment_client):
+        from fastapi import HTTPException
+        down = HTTPException(status_code=502, detail="Payment service unavailable")
+        with patch.object(settings, "AUTH_ROOT_KEY", "outage-test-key"), \
+             patch.object(settings, "X402_PAY_TO", ""), \
+             patch("app.payment.create_invoice", new_callable=AsyncMock, side_effect=down):
+            resp = await payment_client.post("/api/v1/services", json=self.SUBMIT_BODY)
+        assert resp.status_code == 502

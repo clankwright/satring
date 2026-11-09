@@ -100,27 +100,59 @@ async def require_payment(
 
         return settlement
 
-    # No auth headers: return 402 challenge with all configured protocols
-    invoice_data = await create_invoice(amount_sats, memo)
+    # No auth headers: return 402 challenge with all configured protocols.
+    # A Lightning backend outage must not take down the x402 path: if the
+    # invoice can't be minted and x402 is configured, issue an x402-only
+    # challenge instead of a 502.
+    try:
+        invoice_data = await create_invoice(amount_sats, memo)
+    except HTTPException:
+        if not x402_enabled():
+            raise
+        logger.warning("Lightning invoice creation failed; issuing x402-only challenge")
+        invoice_data = None
 
-    # L402 challenge
-    macaroon_b64 = mint_macaroon(invoice_data["payment_hash"])
-    l402_challenge = (
-        f'L402 macaroon="{macaroon_b64}", '
-        f'invoice="{invoice_data["payment_request"]}"'
-    )
-
-    # MPP challenge (uses same invoice, different wire format)
-    mpp_challenge = build_mpp_challenge(
-        amount_sats, invoice_data["payment_hash"],
-        invoice_data["payment_request"], memo,
-    )
-
-    # Combine L402 and MPP in WWW-Authenticate (comma-separated per RFC 9110)
-    headers = {
-        "WWW-Authenticate": f"{l402_challenge}, {mpp_challenge}",
-        "Cache-Control": "no-store",
+    headers = {"Cache-Control": "no-store"}
+    base = settings.BASE_URL.rstrip("/")
+    body = {
+        "detail": "Payment Required",
+        "price": {"sats": amount_sats, "usd": price_usd},
+        "how_to_pay": {},
     }
+
+    if invoice_data is not None:
+        # L402 challenge
+        macaroon_b64 = mint_macaroon(invoice_data["payment_hash"])
+        l402_challenge = (
+            f'L402 macaroon="{macaroon_b64}", '
+            f'invoice="{invoice_data["payment_request"]}"'
+        )
+        # MPP challenge (uses same invoice, different wire format)
+        mpp_challenge = build_mpp_challenge(
+            amount_sats, invoice_data["payment_hash"],
+            invoice_data["payment_request"], memo,
+        )
+        # Combine L402 and MPP in WWW-Authenticate (comma-separated per RFC 9110)
+        headers["WWW-Authenticate"] = f"{l402_challenge}, {mpp_challenge}"
+        body["how_to_pay"]["L402"] = {
+            "steps": [
+                "1. Extract macaroon and invoice from WWW-Authenticate header",
+                "2. Pay the BOLT11 Lightning invoice",
+                "3. Retry with header: Authorization: L402 <macaroon>:<preimage>",
+            ],
+            "docs": f"{base}/.well-known/l402",
+        }
+        body["how_to_pay"]["MPP"] = {
+            "steps": [
+                "1. Extract Payment challenge from WWW-Authenticate header",
+                "2. Pay the BOLT11 invoice in the challenge request field",
+                "3. Build credential with paymentHash and preimage",
+                "4. Retry with header: Authorization: Payment <base64url-credential>",
+            ],
+            "docs": f"{base}/.well-known/mpp",
+        }
+    else:
+        body["lightning_unavailable"] = True
 
     # Add x402 challenge if configured
     if x402_enabled():
@@ -128,30 +160,6 @@ async def require_payment(
         x402_challenge = build_payment_required(price_usd, memo, resource_url, request.method)
         headers["PAYMENT-REQUIRED"] = x402_challenge
 
-    base = settings.BASE_URL.rstrip("/")
-    body = {
-        "detail": "Payment Required",
-        "price": {"sats": amount_sats, "usd": price_usd},
-        "how_to_pay": {
-            "L402": {
-                "steps": [
-                    "1. Extract macaroon and invoice from WWW-Authenticate header",
-                    "2. Pay the BOLT11 Lightning invoice",
-                    "3. Retry with header: Authorization: L402 <macaroon>:<preimage>",
-                ],
-                "docs": f"{base}/.well-known/l402",
-            },
-            "MPP": {
-                "steps": [
-                    "1. Extract Payment challenge from WWW-Authenticate header",
-                    "2. Pay the BOLT11 invoice in the challenge request field",
-                    "3. Build credential with paymentHash and preimage",
-                    "4. Retry with header: Authorization: Payment <base64url-credential>",
-                ],
-                "docs": f"{base}/.well-known/mpp",
-            },
-        },
-    }
     if x402_enabled():
         body["how_to_pay"]["x402"] = {
             "steps": [
